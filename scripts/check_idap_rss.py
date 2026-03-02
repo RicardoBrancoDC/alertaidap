@@ -122,7 +122,6 @@ def tg_send_message(text: str) -> None:
 
 
 def chunk_text(text: str, limit: int = 3600) -> List[str]:
-    # HTML aumenta risco de cortar tag no meio, então deixei o limite menor
     parts: List[str] = []
     buf = ""
 
@@ -305,6 +304,13 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
         if alert is None:
             continue
 
+        # ✅ id do CAP (identifier)
+        cap_identifier = ""
+        for ch in list(alert):
+            if localname(ch.tag) == "identifier":
+                cap_identifier = (ch.text or "").strip()
+                break
+
         info = None
         for ch in list(alert):
             if localname(ch.tag) == "info":
@@ -369,6 +375,7 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
             {
                 "entry_id": entry_id,
                 "entry_updated": entry_updated,
+                "alert_id": cap_identifier,  # ✅ novo campo
                 "onset": info_text("onset"),
                 "senderName": info_text("senderName"),
                 "event": info_text("event"),
@@ -466,9 +473,10 @@ def main() -> int:
             onset_raw = str(e.get("onset") or e.get("entry_updated") or "").strip()
             onset_br = fmt_brasilia(onset_raw)
 
-            sender = truncate(str(e.get("senderName") or "-"), 180)
-            event = truncate(str(e.get("event") or "-"), 90)
-            headline = truncate(str(e.get("headline") or "-"), 800)
+            alert_id = truncate(str(e.get("alert_id") or "-"), 220)
+            sender = truncate(str(e.get("senderName") or "-"), 220)
+            event = truncate(str(e.get("event") or "-"), 120)
+            headline = truncate(str(e.get("headline") or "-"), 1200)
 
             ibge_codes = e.get("ibge_codes") or []
             if not isinstance(ibge_codes, list):
@@ -483,18 +491,23 @@ def main() -> int:
             lvl_emo = nivel_emoji(nivel)
             evt_emo = event_emoji(event)
 
-            # monta mensagem "bonita"
-            title_line = f"🕒 <b>{esc(onset_br)}</b>  |  {lvl_emo} <b>{esc(nivel)}</b>  |  {evt_emo} <b>{esc(event)}</b>"
-            sender_line = f"<b>Emissor:</b> {esc(sender)}"
-            aviso_line = f"<b>Mensagem:</b> {esc(headline)}"
+            # ✅ nova formatação: primeira linha data/hora - ID, resto 1 por linha
+            line1 = f"🕒 <b>{esc(onset_br)}</b> - <code>{esc(alert_id)}</code>"
+            line2 = f"{lvl_emo} <b>Nível:</b> {esc(nivel)}"
+            line3 = f"{evt_emo} <b>Evento:</b> {esc(event)}"
+            line4 = f"🏢 <b>Emissor:</b> {esc(sender)}"
+            line5 = f"📝 <b>Mensagem:</b> {esc(headline)}"
 
             if municipios:
                 mun_txt = format_municipios_list(municipios)
-                footer = f"<b>Municípios ({len(municipios)}):</b> {esc(mun_txt)}"
+                line6 = f"🧭 <b>Municípios ({len(municipios)}):</b> {esc(mun_txt)}"
             else:
-                footer = f"<b>Área:</b> Polígono: {esc(area_desc_txt)}"
+                if area_desc_txt and area_desc_txt != "-":
+                    line6 = f"🧭 <b>Área:</b> Polígono da {esc(area_desc_txt)}"
+                else:
+                    line6 = "🧭 <b>Área:</b> Polígono (sem areaDesc)"
 
-            msg = "\n".join([title_line, sender_line, aviso_line, footer])
+            msg = "\n".join([line1, line2, line3, line4, line5, line6])
 
             for part in chunk_text(msg):
                 tg_send_message(part)
