@@ -485,8 +485,8 @@ def main() -> int:
 
             # monta mensagem "bonita"
             title_line = f"🕒 <b>{esc(onset_br)}</b>  |  {lvl_emo} <b>{esc(nivel)}</b>  |  {evt_emo} <b>{esc(event)}</b>"
-            sender_line = f"<b>Órgão:</b> {esc(sender)}"
-            aviso_line = f"<b>Aviso:</b> {esc(headline)}"
+            sender_line = f"<b>Emissor:</b> {esc(sender)}"
+            aviso_line = f"<b>Mensagem:</b> {esc(headline)}"
 
             if municipios:
                 mun_txt = format_municipios_list(municipios)
