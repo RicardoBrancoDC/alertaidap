@@ -1,0 +1,49 @@
+name: IDAP CAP Monitor
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: idap-cap-monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run checker
+        env:
+          RSS_URL: "https://idapfile.mdr.gov.br/idap/api/rss/cap"
+          STATE_PATH: "state/seen.json"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HTTP_RETRIES: "5"
+          HTTP_RETRY_SLEEP_SECONDS: "2"
+          HTTP_TIMEOUT: "45"
+        run: |
+          python scripts/check_idap_rss.py
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/seen.json || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "Update state"
+            git push
+          fi
