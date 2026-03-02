@@ -3,7 +3,7 @@ name: IDAP CAP Monitor
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: write
