@@ -22,6 +22,10 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "45"))
 HTTP_RETRIES = int(os.environ.get("HTTP_RETRIES", "5"))
 HTTP_RETRY_SLEEP_SECONDS = float(os.environ.get("HTTP_RETRY_SLEEP_SECONDS", "2.0"))
 
+# ritmo de envio para o Telegram (evita 429)
+TG_SEND_SLEEP_SECONDS = float(os.environ.get("TG_SEND_SLEEP_SECONDS", "1.0"))
+TG_SEND_RETRIES = int(os.environ.get("TG_SEND_RETRIES", "6"))
+
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
 IBGE_JSON_PATH = os.environ.get("IBGE_JSON_PATH", "data/ibge_municipios.json").strip()
@@ -34,7 +38,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "github-actions-idap-atom-monitor/1.7"},
+                headers={"User-Agent": "github-actions-idap-atom-monitor/1.8"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -92,16 +96,11 @@ def _tg_call_sendmessage(chat_id: str, text: str, parse_mode: str = "HTML") -> T
         return False, str(e)
 
 
-def tg_send_message(text: str) -> None:
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("Telegram não configurado. Vou só imprimir a mensagem.")
-        print(text)
-        return
-
-    ok, body = _tg_call_sendmessage(TG_CHAT_ID, text)
-    if ok:
-        return
-
+def _extract_retry_after(body: str) -> Optional[int]:
+    """
+    Telegram 429 costuma vir assim:
+    {"ok":false,"error_code":429,"description":"Too Many Requests: retry after 37","parameters":{"retry_after":37}}
+    """
     try:
         j = json.loads(body) if body and body.strip().startswith("{") else None
     except Exception:
@@ -109,16 +108,66 @@ def tg_send_message(text: str) -> None:
 
     if isinstance(j, dict):
         params = j.get("parameters") or {}
-        migrate_to = params.get("migrate_to_chat_id")
-        if migrate_to:
-            print(f"[Telegram] Atenção: chat foi migrado. Novo chat id sugerido: {migrate_to}")
-            ok2, _ = _tg_call_sendmessage(str(migrate_to), text)
-            if ok2:
-                print("[Telegram] Mensagem enviada com sucesso usando migrate_to_chat_id.")
-                print(f"[Telegram] Atualize seu TELEGRAM_CHAT_ID para: {migrate_to}")
-                return
+        ra = params.get("retry_after")
+        if isinstance(ra, int):
+            return ra
+        if isinstance(ra, str) and ra.isdigit():
+            return int(ra)
+    return None
 
-    raise RuntimeError(f"Telegram sendMessage falhou. Resposta: {body}")
+
+def _extract_migrate_to(body: str) -> Optional[str]:
+    try:
+        j = json.loads(body) if body and body.strip().startswith("{") else None
+    except Exception:
+        j = None
+    if isinstance(j, dict):
+        params = j.get("parameters") or {}
+        mt = params.get("migrate_to_chat_id")
+        if mt is None:
+            return None
+        return str(mt)
+    return None
+
+
+def tg_send_message(text: str) -> None:
+    """
+    Envio resiliente:
+    - respeita retry_after do 429
+    - lida com migração de grupo -> supergrupo
+    - aplica um pequeno sleep entre envios
+    """
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Telegram não configurado. Vou só imprimir a mensagem.")
+        print(text)
+        return
+
+    chat_id = TG_CHAT_ID
+
+    for attempt in range(1, TG_SEND_RETRIES + 1):
+        ok, body = _tg_call_sendmessage(chat_id, text)
+        if ok:
+            if TG_SEND_SLEEP_SECONDS > 0:
+                time.sleep(TG_SEND_SLEEP_SECONDS)
+            return
+
+        migrate_to = _extract_migrate_to(body)
+        if migrate_to and migrate_to != chat_id:
+            print(f"[Telegram] chat foi migrado. Tentando enviar no novo chat_id: {migrate_to}")
+            chat_id = migrate_to
+            continue
+
+        retry_after = _extract_retry_after(body)
+        if retry_after is not None:
+            wait_s = int(retry_after) + 1
+            print(f"[Telegram] Rate limit (429). Vou aguardar {wait_s}s e tentar de novo ({attempt}/{TG_SEND_RETRIES}).")
+            time.sleep(wait_s)
+            continue
+
+        # outras falhas, não adianta insistir demais
+        raise RuntimeError(f"Telegram sendMessage falhou. Resposta: {body}")
+
+    raise RuntimeError("Telegram sendMessage falhou após várias tentativas (rate limit ou erro persistente).")
 
 
 def chunk_text(text: str, limit: int = 3600) -> List[str]:
@@ -304,7 +353,6 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
         if alert is None:
             continue
 
-        # ✅ id do CAP (identifier)
         cap_identifier = ""
         for ch in list(alert):
             if localname(ch.tag) == "identifier":
@@ -320,9 +368,9 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
         def info_text(name: str) -> str:
             if info is None:
                 return ""
-            for ch in list(info):
-                if localname(ch.tag) == name:
-                    return (ch.text or "").strip()
+            for ch2 in list(info):
+                if localname(ch2.tag) == name:
+                    return (ch2.text or "").strip()
             return ""
 
         ibges: List[str] = []
@@ -375,7 +423,7 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
             {
                 "entry_id": entry_id,
                 "entry_updated": entry_updated,
-                "alert_id": cap_identifier,  # ✅ novo campo
+                "alert_id": cap_identifier,
                 "onset": info_text("onset"),
                 "senderName": info_text("senderName"),
                 "event": info_text("event"),
@@ -491,7 +539,6 @@ def main() -> int:
             lvl_emo = nivel_emoji(nivel)
             evt_emo = event_emoji(event)
 
-            # ✅ nova formatação: primeira linha data/hora - ID, resto 1 por linha
             line1 = f"🕒 <b>{esc(onset_br)}</b> - <code>{esc(alert_id)}</code>"
             line2 = f"{lvl_emo} <b>Nível:</b> {esc(nivel)}"
             line3 = f"{evt_emo} <b>Evento:</b> {esc(event)}"
@@ -511,8 +558,6 @@ def main() -> int:
 
             for part in chunk_text(msg):
                 tg_send_message(part)
-
-            time.sleep(0.25)
 
     for e in entries:
         eid = str(e.get("entry_id") or "").strip()
