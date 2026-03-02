@@ -9,8 +9,8 @@ import http.client
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
-
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
+import html
 
 RSS_URL = os.environ.get("RSS_URL", "https://idapfile.mdr.gov.br/idap/api/rss/cap").strip()
 STATE_PATH = os.environ.get("STATE_PATH", "state/seen.json").strip()
@@ -34,7 +34,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "github-actions-idap-atom-monitor/1.6"},
+                headers={"User-Agent": "github-actions-idap-atom-monitor/1.7"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -66,7 +66,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
     raise RuntimeError(f"Falha ao baixar {url} após {HTTP_RETRIES} tentativas. Último erro: {last_err}") from last_err
 
 
-def _tg_call_sendmessage(chat_id: str, text: str) -> Tuple[bool, str]:
+def _tg_call_sendmessage(chat_id: str, text: str, parse_mode: str = "HTML") -> Tuple[bool, str]:
     if not TG_TOKEN:
         return False, "TG_TOKEN vazio"
 
@@ -75,6 +75,7 @@ def _tg_call_sendmessage(chat_id: str, text: str) -> Tuple[bool, str]:
         {
             "chat_id": chat_id,
             "text": text,
+            "parse_mode": parse_mode,
             "disable_web_page_preview": "true",
         }
     ).encode("utf-8")
@@ -109,10 +110,9 @@ def tg_send_message(text: str) -> None:
     if isinstance(j, dict):
         params = j.get("parameters") or {}
         migrate_to = params.get("migrate_to_chat_id")
-
         if migrate_to:
             print(f"[Telegram] Atenção: chat foi migrado. Novo chat id sugerido: {migrate_to}")
-            ok2, _body2 = _tg_call_sendmessage(str(migrate_to), text)
+            ok2, _ = _tg_call_sendmessage(str(migrate_to), text)
             if ok2:
                 print("[Telegram] Mensagem enviada com sucesso usando migrate_to_chat_id.")
                 print(f"[Telegram] Atualize seu TELEGRAM_CHAT_ID para: {migrate_to}")
@@ -121,7 +121,8 @@ def tg_send_message(text: str) -> None:
     raise RuntimeError(f"Telegram sendMessage falhou. Resposta: {body}")
 
 
-def chunk_text(text: str, limit: int = 3900) -> List[str]:
+def chunk_text(text: str, limit: int = 3600) -> List[str]:
+    # HTML aumenta risco de cortar tag no meio, então deixei o limite menor
     parts: List[str] = []
     buf = ""
 
@@ -248,6 +249,39 @@ def calc_nivel(severity: str, urgency: str, certainty: str, response_type: str) 
     return "Indefinido"
 
 
+def nivel_emoji(nivel: str) -> str:
+    n = (nivel or "").strip()
+    return {
+        "Extremo": "🟣",
+        "Severo": "🔴",
+        "Alto": "🟠",
+        "Médio": "🟡",
+        "Baixo": "🟢",
+        "Indefinido": "⚪",
+    }.get(n, "⚪")
+
+
+def event_emoji(event: str) -> str:
+    e = (event or "").upper()
+    if "DESLIZ" in e:
+        return "⛰️"
+    if "CHUVA" in e:
+        return "🌧️"
+    if "ALAG" in e or "INUN" in e or "ENXUR" in e:
+        return "🌊"
+    if "VENDAV" in e:
+        return "🌬️"
+    if "GRANIZ" in e:
+        return "🧊"
+    if "RAIO" in e:
+        return "⚡"
+    if "ONDA DE CALOR" in e:
+        return "🥵"
+    if "ONDA DE FRIO" in e or "GEADA" in e:
+        return "🥶"
+    return "📢"
+
+
 def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
     root = ET.fromstring(feed_xml)
     out: List[Dict[str, object]] = []
@@ -294,14 +328,12 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
                     continue
                 area = info_child
 
-                # areaDesc
                 for area_child in list(area):
                     if localname(area_child.tag) == "areaDesc":
                         ad = (area_child.text or "").strip()
                         if ad:
                             area_descs.append(ad)
 
-                # IBGE geocodes
                 for area_child in list(area):
                     if localname(area_child.tag) != "geocode":
                         continue
@@ -318,7 +350,6 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
                             vv_norm = vv_norm.zfill(7)
                         ibges.append(vv_norm)
 
-        # unique IBGE
         seen_codes: Set[str] = set()
         ibges_unique: List[str] = []
         for code in ibges:
@@ -326,7 +357,6 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
                 seen_codes.add(code)
                 ibges_unique.append(code)
 
-        # unique areaDesc
         seen_ad: Set[str] = set()
         area_descs_unique: List[str] = []
         for ad in area_descs:
@@ -390,8 +420,11 @@ def format_area_desc(area_descs: List[str]) -> str:
         return "-"
     if len(ads) == 1:
         return ads[0]
-    # se vier mais de um, junta de um jeito simples
     return "; ".join(ads)
+
+
+def esc(s: str) -> str:
+    return html.escape((s or "").strip())
 
 
 def main() -> int:
@@ -420,7 +453,7 @@ def main() -> int:
 
         new_entries_sorted = sorted(new_entries, key=sort_key)
 
-        tg_send_message(f"Alertas enviados desde a última checagem: {len(new_entries_sorted)}")
+        tg_send_message(f"✅ <b>Novos alertas desde a última checagem:</b> {len(new_entries_sorted)}")
 
         for e in new_entries_sorted:
             nivel = calc_nivel(
@@ -433,9 +466,9 @@ def main() -> int:
             onset_raw = str(e.get("onset") or e.get("entry_updated") or "").strip()
             onset_br = fmt_brasilia(onset_raw)
 
-            sender = truncate(str(e.get("senderName") or "-"), 140)
-            event = truncate(str(e.get("event") or "-"), 80)
-            headline = truncate(str(e.get("headline") or "-"), 650)
+            sender = truncate(str(e.get("senderName") or "-"), 180)
+            event = truncate(str(e.get("event") or "-"), 90)
+            headline = truncate(str(e.get("headline") or "-"), 800)
 
             ibge_codes = e.get("ibge_codes") or []
             if not isinstance(ibge_codes, list):
@@ -447,21 +480,21 @@ def main() -> int:
                 area_descs = []
             area_desc_txt = format_area_desc([str(x) for x in area_descs])
 
-            header = f"[{onset_br}][Nível {nivel}][{sender}][{event}]"
-            base = f"{header}\n{headline}"
+            lvl_emo = nivel_emoji(nivel)
+            evt_emo = event_emoji(event)
+
+            # monta mensagem "bonita"
+            title_line = f"🕒 <b>{esc(onset_br)}</b>  |  {lvl_emo} <b>{esc(nivel)}</b>  |  {evt_emo} <b>{esc(event)}</b>"
+            sender_line = f"<b>Órgão:</b> {esc(sender)}"
+            aviso_line = f"<b>Aviso:</b> {esc(headline)}"
 
             if municipios:
-                municipios_txt = format_municipios_list(municipios)
-                msg = (
-                    f"{base}\n"
-                    f"Municípios: {len(municipios)}\n"
-                    f"{municipios_txt}"
-                )
+                mun_txt = format_municipios_list(municipios)
+                footer = f"<b>Municípios ({len(municipios)}):</b> {esc(mun_txt)}"
             else:
-                msg = (
-                    f"{base}\n"
-                    f"Polígono: {area_desc_txt}"
-                )
+                footer = f"<b>Área:</b> Polígono da {esc(area_desc_txt)}"
+
+            msg = "\n".join([title_line, sender_line, aviso_line, footer])
 
             for part in chunk_text(msg):
                 tg_send_message(part)
