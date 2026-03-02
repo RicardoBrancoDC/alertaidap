@@ -8,7 +8,7 @@ import urllib.error
 import http.client
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from zoneinfo import ZoneInfo  # Python 3.9+
 
@@ -24,10 +24,7 @@ HTTP_RETRY_SLEEP_SECONDS = float(os.environ.get("HTTP_RETRY_SLEEP_SECONDS", "2.0
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
-# Caminho do dicionário IBGE -> Município/UF
 IBGE_JSON_PATH = os.environ.get("IBGE_JSON_PATH", "data/ibge_municipios.json").strip()
-
-# Quantos municípios listar na mensagem antes de resumir
 MAX_MUNICIPIOS_LISTAR = int(os.environ.get("MAX_MUNICIPIOS_LISTAR", "15"))
 
 
@@ -37,7 +34,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "github-actions-idap-atom-monitor/1.4"},
+                headers={"User-Agent": "github-actions-idap-atom-monitor/1.6"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -69,29 +66,59 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
     raise RuntimeError(f"Falha ao baixar {url} após {HTTP_RETRIES} tentativas. Último erro: {last_err}") from last_err
 
 
-def tg_send_message(text: str) -> None:
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("Telegram não configurado. Vou só imprimir a mensagem.")
-        print(text)
-        return
+def _tg_call_sendmessage(chat_id: str, text: str) -> Tuple[bool, str]:
+    if not TG_TOKEN:
+        return False, "TG_TOKEN vazio"
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode(
         {
-            "chat_id": TG_CHAT_ID,
+            "chat_id": chat_id,
             "text": text,
             "disable_web_page_preview": "true",
         }
     ).encode("utf-8")
 
     req = urllib.request.Request(url, data=data, method="POST")
-
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            _ = resp.read()
+            body = resp.read().decode("utf-8", errors="ignore")
+            return True, body
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Telegram sendMessage falhou: HTTP {e.code}: {body}") from e
+        return False, body
+    except Exception as e:
+        return False, str(e)
+
+
+def tg_send_message(text: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Telegram não configurado. Vou só imprimir a mensagem.")
+        print(text)
+        return
+
+    ok, body = _tg_call_sendmessage(TG_CHAT_ID, text)
+    if ok:
+        return
+
+    try:
+        j = json.loads(body) if body and body.strip().startswith("{") else None
+    except Exception:
+        j = None
+
+    if isinstance(j, dict):
+        params = j.get("parameters") or {}
+        migrate_to = params.get("migrate_to_chat_id")
+
+        if migrate_to:
+            print(f"[Telegram] Atenção: chat foi migrado. Novo chat id sugerido: {migrate_to}")
+            ok2, _body2 = _tg_call_sendmessage(str(migrate_to), text)
+            if ok2:
+                print("[Telegram] Mensagem enviada com sucesso usando migrate_to_chat_id.")
+                print(f"[Telegram] Atualize seu TELEGRAM_CHAT_ID para: {migrate_to}")
+                return
+
+    raise RuntimeError(f"Telegram sendMessage falhou. Resposta: {body}")
 
 
 def chunk_text(text: str, limit: int = 3900) -> List[str]:
@@ -194,9 +221,7 @@ def load_ibge_map() -> Dict[str, Dict[str, object]]:
     try:
         with open(IBGE_JSON_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return data
-        return {}
+        return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f"Atenção: falha ao ler {IBGE_JSON_PATH}: {e}. Vou seguir sem nomes de municípios.")
         return {}
@@ -216,7 +241,6 @@ def calc_nivel(severity: str, urgency: str, certainty: str, response_type: str) 
         return "Baixo"
 
     if s == "Severe":
-        # Severo: combinação exata que você passou
         if (u == "Expected") and (c in {"Likely", "Observed"}) and (r in {"Execute", "Prepare"}):
             return "Severo"
         return "Alto"
@@ -261,13 +285,23 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
                     return (ch.text or "").strip()
             return ""
 
-        # Coleta IBGE(s) de todas as áreas
         ibges: List[str] = []
+        area_descs: List[str] = []
+
         if info is not None:
             for info_child in list(info):
                 if localname(info_child.tag) != "area":
                     continue
                 area = info_child
+
+                # areaDesc
+                for area_child in list(area):
+                    if localname(area_child.tag) == "areaDesc":
+                        ad = (area_child.text or "").strip()
+                        if ad:
+                            area_descs.append(ad)
+
+                # IBGE geocodes
                 for area_child in list(area):
                     if localname(area_child.tag) != "geocode":
                         continue
@@ -279,19 +313,27 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
                         elif localname(gc_child.tag) == "value":
                             vv = (gc_child.text or "").strip()
                     if vn.upper() == "IBGE" and vv:
-                        # garante 7 dígitos quando vier como número solto
                         vv_norm = vv.strip()
                         if vv_norm.isdigit():
                             vv_norm = vv_norm.zfill(7)
                         ibges.append(vv_norm)
 
-        # remove duplicados preservando ordem
+        # unique IBGE
         seen_codes: Set[str] = set()
         ibges_unique: List[str] = []
         for code in ibges:
             if code and code not in seen_codes:
                 seen_codes.add(code)
                 ibges_unique.append(code)
+
+        # unique areaDesc
+        seen_ad: Set[str] = set()
+        area_descs_unique: List[str] = []
+        for ad in area_descs:
+            ad2 = ad.strip()
+            if ad2 and ad2 not in seen_ad:
+                seen_ad.add(ad2)
+                area_descs_unique.append(ad2)
 
         out.append(
             {
@@ -306,6 +348,7 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
                 "certainty": info_text("certainty"),
                 "responseType": info_text("responseType"),
                 "ibge_codes": ibges_unique,
+                "area_descs": area_descs_unique,
             }
         )
 
@@ -317,7 +360,7 @@ def ibge_codes_to_names(codes: List[str], ibge_map: Dict[str, Dict[str, object]]
     for code in codes or []:
         item = ibge_map.get(code)
         if not item:
-            names.append(code)  # fallback: mostra o código mesmo
+            names.append(code)
             continue
         nome = str(item.get("nome", "")).strip()
         uf = str(item.get("uf", "")).strip()
@@ -339,6 +382,16 @@ def format_municipios_list(muns: List[str]) -> str:
     primeiros = "; ".join(muns[:MAX_MUNICIPIOS_LISTAR])
     resto = total - MAX_MUNICIPIOS_LISTAR
     return f"{primeiros}; +{resto} outros"
+
+
+def format_area_desc(area_descs: List[str]) -> str:
+    ads = [a.strip() for a in (area_descs or []) if a and a.strip()]
+    if not ads:
+        return "-"
+    if len(ads) == 1:
+        return ads[0]
+    # se vier mais de um, junta de um jeito simples
+    return "; ".join(ads)
 
 
 def main() -> int:
@@ -388,21 +441,33 @@ def main() -> int:
             if not isinstance(ibge_codes, list):
                 ibge_codes = []
             municipios = ibge_codes_to_names([str(x) for x in ibge_codes], ibge_map)
-            municipios_txt = format_municipios_list(municipios)
 
-            msg = (
-                f"[{onset_br}][Nível {nivel}][{sender}][{event}]\n"
-                f"{headline}\n"
-                f"Municípios: {len(municipios)}\n"
-                f"{municipios_txt}"
-            )
+            area_descs = e.get("area_descs") or []
+            if not isinstance(area_descs, list):
+                area_descs = []
+            area_desc_txt = format_area_desc([str(x) for x in area_descs])
+
+            header = f"[{onset_br}][Nível {nivel}][{sender}][{event}]"
+            base = f"{header}\n{headline}"
+
+            if municipios:
+                municipios_txt = format_municipios_list(municipios)
+                msg = (
+                    f"{base}\n"
+                    f"Municípios: {len(municipios)}\n"
+                    f"{municipios_txt}"
+                )
+            else:
+                msg = (
+                    f"{base}\n"
+                    f"Polígono da {area_desc_txt}"
+                )
 
             for part in chunk_text(msg):
                 tg_send_message(part)
 
             time.sleep(0.25)
 
-    # marca como vistos
     for e in entries:
         eid = str(e.get("entry_id") or "").strip()
         if eid:
