@@ -24,6 +24,12 @@ HTTP_RETRY_SLEEP_SECONDS = float(os.environ.get("HTTP_RETRY_SLEEP_SECONDS", "2.0
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
+# Caminho do dicionário IBGE -> Município/UF
+IBGE_JSON_PATH = os.environ.get("IBGE_JSON_PATH", "data/ibge_municipios.json").strip()
+
+# Quantos municípios listar na mensagem antes de resumir
+MAX_MUNICIPIOS_LISTAR = int(os.environ.get("MAX_MUNICIPIOS_LISTAR", "15"))
+
 
 def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
     last_err: Optional[Exception] = None
@@ -31,7 +37,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "github-actions-idap-atom-monitor/1.3"},
+                headers={"User-Agent": "github-actions-idap-atom-monitor/1.4"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -126,12 +132,10 @@ def parse_any_iso(dt_str: str) -> Optional[datetime]:
     s = (dt_str or "").strip()
     if not s:
         return None
-    # trata Z
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(s)
-        # se vier sem tzinfo, assume UTC (raro, mas melhor do que quebrar)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -144,7 +148,6 @@ def fmt_brasilia(dt_str: str) -> str:
     if not dt:
         return "-"
     br = dt.astimezone(BR_TZ)
-    # exemplo: 01/03 08:57 (BRT)
     return br.strftime("%d/%m %H:%M")
 
 
@@ -182,6 +185,23 @@ def save_state(state: Dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def load_ibge_map() -> Dict[str, Dict[str, object]]:
+    if not IBGE_JSON_PATH:
+        return {}
+    if not os.path.exists(IBGE_JSON_PATH):
+        print(f"Atenção: não achei o arquivo IBGE em {IBGE_JSON_PATH}. Vou seguir sem nomes de municípios.")
+        return {}
+    try:
+        with open(IBGE_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception as e:
+        print(f"Atenção: falha ao ler {IBGE_JSON_PATH}: {e}. Vou seguir sem nomes de municípios.")
+        return {}
+
+
 def calc_nivel(severity: str, urgency: str, certainty: str, response_type: str) -> str:
     s = (severity or "").strip()
     u = (urgency or "").strip()
@@ -196,7 +216,7 @@ def calc_nivel(severity: str, urgency: str, certainty: str, response_type: str) 
         return "Baixo"
 
     if s == "Severe":
-        # Severo: combinação exata
+        # Severo: combinação exata que você passou
         if (u == "Expected") and (c in {"Likely", "Observed"}) and (r in {"Execute", "Prepare"}):
             return "Severo"
         return "Alto"
@@ -204,9 +224,9 @@ def calc_nivel(severity: str, urgency: str, certainty: str, response_type: str) 
     return "Indefinido"
 
 
-def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, str]]:
+def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
     root = ET.fromstring(feed_xml)
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, object]] = []
 
     for entry in list(root):
         if localname(entry.tag) != "entry":
@@ -241,6 +261,38 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, str]]:
                     return (ch.text or "").strip()
             return ""
 
+        # Coleta IBGE(s) de todas as áreas
+        ibges: List[str] = []
+        if info is not None:
+            for info_child in list(info):
+                if localname(info_child.tag) != "area":
+                    continue
+                area = info_child
+                for area_child in list(area):
+                    if localname(area_child.tag) != "geocode":
+                        continue
+                    vn = ""
+                    vv = ""
+                    for gc_child in list(area_child):
+                        if localname(gc_child.tag) == "valueName":
+                            vn = (gc_child.text or "").strip()
+                        elif localname(gc_child.tag) == "value":
+                            vv = (gc_child.text or "").strip()
+                    if vn.upper() == "IBGE" and vv:
+                        # garante 7 dígitos quando vier como número solto
+                        vv_norm = vv.strip()
+                        if vv_norm.isdigit():
+                            vv_norm = vv_norm.zfill(7)
+                        ibges.append(vv_norm)
+
+        # remove duplicados preservando ordem
+        seen_codes: Set[str] = set()
+        ibges_unique: List[str] = []
+        for code in ibges:
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                ibges_unique.append(code)
+
         out.append(
             {
                 "entry_id": entry_id,
@@ -253,16 +305,48 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, str]]:
                 "urgency": info_text("urgency"),
                 "certainty": info_text("certainty"),
                 "responseType": info_text("responseType"),
+                "ibge_codes": ibges_unique,
             }
         )
 
     return out
 
 
+def ibge_codes_to_names(codes: List[str], ibge_map: Dict[str, Dict[str, object]]) -> List[str]:
+    names: List[str] = []
+    for code in codes or []:
+        item = ibge_map.get(code)
+        if not item:
+            names.append(code)  # fallback: mostra o código mesmo
+            continue
+        nome = str(item.get("nome", "")).strip()
+        uf = str(item.get("uf", "")).strip()
+        if nome and uf:
+            names.append(f"{nome}/{uf}")
+        elif nome:
+            names.append(nome)
+        else:
+            names.append(code)
+    return names
+
+
+def format_municipios_list(muns: List[str]) -> str:
+    if not muns:
+        return "-"
+    total = len(muns)
+    if total <= MAX_MUNICIPIOS_LISTAR:
+        return "; ".join(muns)
+    primeiros = "; ".join(muns[:MAX_MUNICIPIOS_LISTAR])
+    resto = total - MAX_MUNICIPIOS_LISTAR
+    return f"{primeiros}; +{resto} outros"
+
+
 def main() -> int:
     if not RSS_URL:
         print("RSS_URL vazio.")
         return 2
+
+    ibge_map = load_ibge_map()
 
     now_utc = datetime.now(timezone.utc)
     state = load_state()
@@ -274,48 +358,53 @@ def main() -> int:
 
     print(f"Entries no feed: {len(entries)}")
 
-    new_entries = [e for e in entries if e.get("entry_id") and e["entry_id"] not in seen]
+    new_entries = [e for e in entries if e.get("entry_id") and str(e["entry_id"]) not in seen]
     print(f"Novos desde a última execução: {len(new_entries)}")
 
     if new_entries:
-        def sort_key(e: Dict[str, str]) -> str:
-            return e.get("onset") or e.get("entry_updated") or ""
+        def sort_key(e: Dict[str, object]) -> str:
+            return str(e.get("onset") or e.get("entry_updated") or "")
 
         new_entries_sorted = sorted(new_entries, key=sort_key)
 
-        # opcional: manda um resumão primeiro
         tg_send_message(f"Alertas enviados desde a última checagem: {len(new_entries_sorted)}")
 
         for e in new_entries_sorted:
             nivel = calc_nivel(
-                e.get("severity", ""),
-                e.get("urgency", ""),
-                e.get("certainty", ""),
-                e.get("responseType", ""),
+                str(e.get("severity", "")),
+                str(e.get("urgency", "")),
+                str(e.get("certainty", "")),
+                str(e.get("responseType", "")),
             )
 
-            onset_raw = (e.get("onset") or e.get("entry_updated") or "").strip()
+            onset_raw = str(e.get("onset") or e.get("entry_updated") or "").strip()
             onset_br = fmt_brasilia(onset_raw)
 
-            sender = truncate(e.get("senderName") or "-", 140)
-            event = truncate(e.get("event") or "-", 80)
-            headline = truncate(e.get("headline") or "-", 500)
+            sender = truncate(str(e.get("senderName") or "-"), 140)
+            event = truncate(str(e.get("event") or "-"), 80)
+            headline = truncate(str(e.get("headline") or "-"), 650)
+
+            ibge_codes = e.get("ibge_codes") or []
+            if not isinstance(ibge_codes, list):
+                ibge_codes = []
+            municipios = ibge_codes_to_names([str(x) for x in ibge_codes], ibge_map)
+            municipios_txt = format_municipios_list(municipios)
 
             msg = (
                 f"[{onset_br}][Nível {nivel}][{sender}][{event}]\n"
-                f"{headline}"
+                f"{headline}\n"
+                f"Municípios: {len(municipios)}\n"
+                f"{municipios_txt}"
             )
 
-            # cada alerta vira 1 mensagem
             for part in chunk_text(msg):
                 tg_send_message(part)
 
-            # evita bater em limite do Telegram se vier muitos
-            time.sleep(0.2)
+            time.sleep(0.25)
 
     # marca como vistos
     for e in entries:
-        eid = (e.get("entry_id") or "").strip()
+        eid = str(e.get("entry_id") or "").strip()
         if eid:
             seen.add(eid)
 
