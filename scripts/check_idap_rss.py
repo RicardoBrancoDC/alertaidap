@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 RSS_URL = os.environ.get("RSS_URL", "https://idapfile.mdr.gov.br/idap/api/rss/cap").strip()
 STATE_PATH = os.environ.get("STATE_PATH", "state/seen.json").strip()
@@ -21,6 +22,8 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "45"))
 HTTP_RETRIES = int(os.environ.get("HTTP_RETRIES", "5"))
 HTTP_RETRY_SLEEP_SECONDS = float(os.environ.get("HTTP_RETRY_SLEEP_SECONDS", "2.0"))
 
+BR_TZ = ZoneInfo("America/Sao_Paulo")
+
 
 def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
     last_err: Optional[Exception] = None
@@ -28,7 +31,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "github-actions-idap-atom-monitor/1.2"},
+                headers={"User-Agent": "github-actions-idap-atom-monitor/1.3"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -117,6 +120,32 @@ def truncate(s: str, max_len: int) -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - 1].rstrip() + "…"
+
+
+def parse_any_iso(dt_str: str) -> Optional[datetime]:
+    s = (dt_str or "").strip()
+    if not s:
+        return None
+    # trata Z
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        # se vier sem tzinfo, assume UTC (raro, mas melhor do que quebrar)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def fmt_brasilia(dt_str: str) -> str:
+    dt = parse_any_iso(dt_str)
+    if not dt:
+        return "-"
+    br = dt.astimezone(BR_TZ)
+    # exemplo: 01/03 08:57 (BRT)
+    return br.strftime("%d/%m %H:%M")
 
 
 def localname(tag: str) -> str:
@@ -254,8 +283,8 @@ def main() -> int:
 
         new_entries_sorted = sorted(new_entries, key=sort_key)
 
-        lines: List[str] = []
-        lines.append(f"Alertas enviados: {len(new_entries_sorted)}")
+        # opcional: manda um resumão primeiro
+        tg_send_message(f"Alertas enviados desde a última checagem: {len(new_entries_sorted)}")
 
         for e in new_entries_sorted:
             nivel = calc_nivel(
@@ -265,17 +294,26 @@ def main() -> int:
                 e.get("responseType", ""),
             )
 
-            onset = (e.get("onset") or e.get("entry_updated") or "-").strip()
-            sender = truncate(e.get("senderName") or "-", 120)
-            event = truncate(e.get("event") or "-", 60)
-            headline = truncate(e.get("headline") or "-", 280)
+            onset_raw = (e.get("onset") or e.get("entry_updated") or "").strip()
+            onset_br = fmt_brasilia(onset_raw)
 
-            lines.append(f"[{onset}][Nível {nivel}][{sender}][{event}][{headline}]")
+            sender = truncate(e.get("senderName") or "-", 140)
+            event = truncate(e.get("event") or "-", 80)
+            headline = truncate(e.get("headline") or "-", 500)
 
-        msg = "\n".join(lines).strip()
-        for part in chunk_text(msg):
-            tg_send_message(part)
+            msg = (
+                f"[{onset_br}][Nível {nivel}][{sender}][{event}]\n"
+                f"{headline}"
+            )
 
+            # cada alerta vira 1 mensagem
+            for part in chunk_text(msg):
+                tg_send_message(part)
+
+            # evita bater em limite do Telegram se vier muitos
+            time.sleep(0.2)
+
+    # marca como vistos
     for e in entries:
         eid = (e.get("entry_id") or "").strip()
         if eid:
