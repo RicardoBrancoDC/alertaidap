@@ -460,7 +460,7 @@ def main() -> int:
             else:
                 msg = (
                     f"{base}\n"
-                    f"Polígono da {area_desc_txt}"
+                    f"Polígono: {area_desc_txt}"
                 )
 
             for part in chunk_text(msg):
