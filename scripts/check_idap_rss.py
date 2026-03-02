@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 import html
+import socket
 
 RSS_URL = os.environ.get("RSS_URL", "https://idapfile.mdr.gov.br/idap/api/rss/cap").strip()
 STATE_PATH = os.environ.get("STATE_PATH", "state/seen.json").strip()
@@ -22,9 +23,10 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "45"))
 HTTP_RETRIES = int(os.environ.get("HTTP_RETRIES", "5"))
 HTTP_RETRY_SLEEP_SECONDS = float(os.environ.get("HTTP_RETRY_SLEEP_SECONDS", "2.0"))
 
-# ritmo de envio para o Telegram (evita 429)
-TG_SEND_SLEEP_SECONDS = float(os.environ.get("TG_SEND_SLEEP_SECONDS", "1.0"))
+# Telegram tuning
+TG_HTTP_TIMEOUT = int(os.environ.get("TG_HTTP_TIMEOUT", "90"))  # era 30; Actions às vezes precisa mais
 TG_SEND_RETRIES = int(os.environ.get("TG_SEND_RETRIES", "6"))
+TG_SEND_SLEEP_SECONDS = float(os.environ.get("TG_SEND_SLEEP_SECONDS", "1.2"))  # pausa entre mensagens
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -38,7 +40,7 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "github-actions-idap-atom-monitor/1.8"},
+                headers={"User-Agent": "github-actions-idap-atom-monitor/1.7"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -70,9 +72,13 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
     raise RuntimeError(f"Falha ao baixar {url} após {HTTP_RETRIES} tentativas. Último erro: {last_err}") from last_err
 
 
-def _tg_call_sendmessage(chat_id: str, text: str, parse_mode: str = "HTML") -> Tuple[bool, str]:
+def _tg_call_sendmessage(chat_id: str, text: str, parse_mode: str = "HTML") -> Tuple[bool, str, Optional[int]]:
+    """
+    Retorna (ok, body, http_status_code)
+    - Se timeout/URLError, http_status_code = None
+    """
     if not TG_TOKEN:
-        return False, "TG_TOKEN vazio"
+        return False, "TG_TOKEN vazio", None
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode(
@@ -86,88 +92,89 @@ def _tg_call_sendmessage(chat_id: str, text: str, parse_mode: str = "HTML") -> T
 
     req = urllib.request.Request(url, data=data, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=TG_HTTP_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
-            return True, body
+            return True, body, getattr(resp, "status", 200)
+
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        return False, body
+        return False, body, e.code
+
+    except (socket.timeout, TimeoutError) as e:
+        return False, f"timeout: {e}", None
+
+    except urllib.error.URLError as e:
+        # às vezes vem timeout embrulhado aqui também
+        return False, f"urlerror: {e}", None
+
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def _extract_retry_after(body: str) -> Optional[int]:
+def tg_send_message(text: str) -> bool:
     """
-    Telegram 429 costuma vir assim:
-    {"ok":false,"error_code":429,"description":"Too Many Requests: retry after 37","parameters":{"retry_after":37}}
-    """
-    try:
-        j = json.loads(body) if body and body.strip().startswith("{") else None
-    except Exception:
-        j = None
-
-    if isinstance(j, dict):
-        params = j.get("parameters") or {}
-        ra = params.get("retry_after")
-        if isinstance(ra, int):
-            return ra
-        if isinstance(ra, str) and ra.isdigit():
-            return int(ra)
-    return None
-
-
-def _extract_migrate_to(body: str) -> Optional[str]:
-    try:
-        j = json.loads(body) if body and body.strip().startswith("{") else None
-    except Exception:
-        j = None
-    if isinstance(j, dict):
-        params = j.get("parameters") or {}
-        mt = params.get("migrate_to_chat_id")
-        if mt is None:
-            return None
-        return str(mt)
-    return None
-
-
-def tg_send_message(text: str) -> None:
-    """
-    Envio resiliente:
-    - respeita retry_after do 429
-    - lida com migração de grupo -> supergrupo
-    - aplica um pequeno sleep entre envios
+    Envia com retry e NÃO derruba o script por 1 falha.
+    Retorna True se enviou, False se desistiu.
     """
     if not TG_TOKEN or not TG_CHAT_ID:
         print("Telegram não configurado. Vou só imprimir a mensagem.")
         print(text)
-        return
+        return True
 
-    chat_id = TG_CHAT_ID
-
+    last_body = ""
     for attempt in range(1, TG_SEND_RETRIES + 1):
-        ok, body = _tg_call_sendmessage(chat_id, text)
+        ok, body, code = _tg_call_sendmessage(TG_CHAT_ID, text)
+        last_body = body
+
         if ok:
-            if TG_SEND_SLEEP_SECONDS > 0:
-                time.sleep(TG_SEND_SLEEP_SECONDS)
-            return
+            return True
 
-        migrate_to = _extract_migrate_to(body)
-        if migrate_to and migrate_to != chat_id:
-            print(f"[Telegram] chat foi migrado. Tentando enviar no novo chat_id: {migrate_to}")
-            chat_id = migrate_to
+        # tenta interpretar resposta JSON do telegram
+        j = None
+        try:
+            if body and body.strip().startswith("{"):
+                j = json.loads(body)
+        except Exception:
+            j = None
+
+        # caso do supergroup migrate
+        if isinstance(j, dict):
+            params = j.get("parameters") or {}
+            migrate_to = params.get("migrate_to_chat_id")
+            if migrate_to:
+                print(f"[Telegram] chat foi migrado. Tentando enviar no novo chat id: {migrate_to}")
+                ok2, body2, _ = _tg_call_sendmessage(str(migrate_to), text)
+                if ok2:
+                    print(f"[Telegram] enviado via migrate_to_chat_id. Atualize TELEGRAM_CHAT_ID para {migrate_to}.")
+                    return True
+                last_body = body2
+
+        # rate limit: respeitar retry_after
+        if isinstance(j, dict) and (j.get("error_code") == 429 or code == 429):
+            retry_after = None
+            try:
+                retry_after = int((j.get("parameters") or {}).get("retry_after") or 0)
+            except Exception:
+                retry_after = None
+            sleep_s = retry_after if retry_after and retry_after > 0 else (2 * attempt)
+            print(f"[Telegram] 429 Too Many Requests. Dormindo {sleep_s}s e tentando de novo ({attempt}/{TG_SEND_RETRIES})...")
+            time.sleep(sleep_s)
             continue
 
-        retry_after = _extract_retry_after(body)
-        if retry_after is not None:
-            wait_s = int(retry_after) + 1
-            print(f"[Telegram] Rate limit (429). Vou aguardar {wait_s}s e tentar de novo ({attempt}/{TG_SEND_RETRIES}).")
-            time.sleep(wait_s)
+        # timeout / erros transitórios: backoff simples
+        if code is None:
+            sleep_s = 2 * attempt
+            print(f"[Telegram] falhou por rede/timeout. Dormindo {sleep_s}s e tentando de novo ({attempt}/{TG_SEND_RETRIES})... ({body})")
+            time.sleep(sleep_s)
             continue
 
-        # outras falhas, não adianta insistir demais
-        raise RuntimeError(f"Telegram sendMessage falhou. Resposta: {body}")
+        # outros HTTP errors: tenta algumas vezes também
+        sleep_s = 2 * attempt
+        print(f"[Telegram] HTTP {code}. Dormindo {sleep_s}s e tentando de novo ({attempt}/{TG_SEND_RETRIES})... Body: {str(body)[:180]}")
+        time.sleep(sleep_s)
 
-    raise RuntimeError("Telegram sendMessage falhou após várias tentativas (rate limit ou erro persistente).")
+    print(f"[Telegram] Desisti de enviar após {TG_SEND_RETRIES} tentativas. Última resposta: {str(last_body)[:300]}")
+    return False
 
 
 def chunk_text(text: str, limit: int = 3600) -> List[str]:
@@ -368,9 +375,9 @@ def parse_atom_feed(feed_xml: bytes) -> List[Dict[str, object]]:
         def info_text(name: str) -> str:
             if info is None:
                 return ""
-            for ch2 in list(info):
-                if localname(ch2.tag) == name:
-                    return (ch2.text or "").strip()
+            for ch in list(info):
+                if localname(ch.tag) == name:
+                    return (ch.text or "").strip()
             return ""
 
         ibges: List[str] = []
@@ -502,6 +509,8 @@ def main() -> int:
     new_entries = [e for e in entries if e.get("entry_id") and str(e["entry_id"]) not in seen]
     print(f"Novos desde a última execução: {len(new_entries)}")
 
+    falhas = 0
+
     if new_entries:
         def sort_key(e: Dict[str, object]) -> str:
             return str(e.get("onset") or e.get("entry_updated") or "")
@@ -509,6 +518,7 @@ def main() -> int:
         new_entries_sorted = sorted(new_entries, key=sort_key)
 
         tg_send_message(f"✅ <b>Novos alertas desde a última checagem:</b> {len(new_entries_sorted)}")
+        time.sleep(TG_SEND_SLEEP_SECONDS)
 
         for e in new_entries_sorted:
             nivel = calc_nivel(
@@ -550,15 +560,27 @@ def main() -> int:
                 line6 = f"🧭 <b>Municípios ({len(municipios)}):</b> {esc(mun_txt)}"
             else:
                 if area_desc_txt and area_desc_txt != "-":
-                    line6 = f"🧭 <b>Área:</b> Polígono: {esc(area_desc_txt)}"
+                    line6 = f"🧭 <b>Área:</b> Polígono em {esc(area_desc_txt)}"
                 else:
-                    line6 = "🧭 <b>Área:</b> Polígono (sem areaDesc)"
+                    line6 = "🧭 <b>Área:</b> Polígono Ausente"
 
             msg = "\n".join([line1, line2, line3, line4, line5, line6])
 
+            ok_all_parts = True
             for part in chunk_text(msg):
-                tg_send_message(part)
+                if not tg_send_message(part):
+                    ok_all_parts = False
+                time.sleep(TG_SEND_SLEEP_SECONDS)
 
+            if not ok_all_parts:
+                falhas += 1
+
+            # marca como visto mesmo assim, para não ficar reenviando tudo eternamente
+            eid = str(e.get("entry_id") or "").strip()
+            if eid:
+                seen.add(eid)
+
+    # marca todo feed como visto (mantém comportamento original)
     for e in entries:
         eid = str(e.get("entry_id") or "").strip()
         if eid:
@@ -573,6 +595,9 @@ def main() -> int:
 
     save_state(state)
     print(f"Estado salvo em {STATE_PATH}. Total vistos: {len(state['seen_ids'])}")
+
+    if falhas:
+        print(f"Atenção: houve falhas ao enviar {falhas} alerta(s).")
     return 0
 
 
