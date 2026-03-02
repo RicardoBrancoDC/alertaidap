@@ -503,7 +503,7 @@ def main() -> int:
                 line6 = f"🧭 <b>Municípios ({len(municipios)}):</b> {esc(mun_txt)}"
             else:
                 if area_desc_txt and area_desc_txt != "-":
-                    line6 = f"🧭 <b>Área:</b> Polígono da {esc(area_desc_txt)}"
+                    line6 = f"🧭 <b>Área:</b> Polígono: {esc(area_desc_txt)}"
                 else:
                     line6 = "🧭 <b>Área:</b> Polígono (sem areaDesc)"
 
