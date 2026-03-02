@@ -492,7 +492,7 @@ def main() -> int:
                 mun_txt = format_municipios_list(municipios)
                 footer = f"<b>Municípios ({len(municipios)}):</b> {esc(mun_txt)}"
             else:
-                footer = f"<b>Área:</b> Polígono da {esc(area_desc_txt)}"
+                footer = f"<b>Área:</b> Polígono: {esc(area_desc_txt)}"
 
             msg = "\n".join([title_line, sender_line, aviso_line, footer])
 
