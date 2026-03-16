@@ -290,16 +290,18 @@ def calc_nivel(severity: str, urgency: str, certainty: str, response_type: str) 
     r = (response_type or "").strip()
 
     if s == "Extreme":
-        return "Extremo"
-    if s == "Moderate":
-        return "Médio"
-    if s == "Minor":
-        return "Baixo"
+        if u == "Immediate" and c in {"Likely", "Observed"} and r in {"Evacuate", "Shelter"}:
+            return "Extremo"
+        return "Severo"
 
     if s == "Severe":
-        if (u == "Expected") and (c in {"Likely", "Observed"}) and (r in {"Execute", "Prepare"}):
-            return "Severo"
         return "Alto"
+
+    if s == "Moderate":
+        return "Médio"
+
+    if s == "Minor":
+        return "Baixo"
 
     return "Indefinido"
 
